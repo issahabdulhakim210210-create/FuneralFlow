@@ -1,0 +1,4 @@
+import bcrypt from 'bcryptjs'; import { query } from '../config/db.js'; import { otpExpiry } from '../utils/validation.js';
+export function generateOtp(){ return String(Math.floor(100000+Math.random()*900000)); }
+export async function createOtp(target:string,purpose='AUTH'){ const code=generateOtp(); const hash=await bcrypt.hash(code,10); await query('insert into otps(target,purpose,otp_hash,expires_at) values($1,$2,$3,$4)',[target,purpose,hash,otpExpiry(10)]); console.log('DEV OTP for',target,code); return code; }
+export async function verifyOtp(target:string,code:string,purpose='AUTH'){ const {rows}=await query('select * from otps where target=$1 and purpose=$2 and used_at is null and expires_at>now() order by created_at desc limit 1',[target,purpose]); if(!rows[0]) return false; const ok=await bcrypt.compare(code,rows[0].otp_hash); if(ok) await query('update otps set used_at=now() where id=$1',[rows[0].id]); return ok; }

@@ -1,0 +1,31 @@
+{
+  "expo": {
+    "name": "Funeral Flow",
+    "slug": "funeral-flow",
+    "icon": "./assets/icon.png",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "scheme": "funeralms",
+    "userInterfaceStyle": "automatic",
+    "jsEngine": "jsc",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.funeralms.app"
+    },
+    "android": {
+      "package": "com.funeralms.app",
+      "adaptiveIcon": {
+        "backgroundColor": "#111827",
+        "foregroundImage": "./assets/icon-foreground.png"
+      }
+    },
+    "web": {
+      "favicon": "./assets/favicon.png",
+      "output": "single"
+    },
+    "plugins": [
+      "expo-notifications",
+      "expo-apple-authentication"
+    ]
+  }
+}

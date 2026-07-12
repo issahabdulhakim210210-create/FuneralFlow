@@ -1,0 +1,12 @@
+import { Router } from 'express';
+import { authenticate } from '../middleware/auth.js';
+import { initialize, verify, history, outstanding, publicPaystackCallback } from '../controllers/paymentController.js';
+const r = Router();
+r.get('/paystack/callback', publicPaystackCallback);
+r.post('/paystack/callback', publicPaystackCallback);
+r.use(authenticate);
+r.post('/initialize', initialize);
+r.post('/verify', verify);
+r.get('/history', history);
+r.get('/outstanding', outstanding);
+export default r;
