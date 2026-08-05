@@ -2,6 +2,7 @@ services:
   - type: web
     name: funeralflow-server
     env: node
+    root: server
     plan: free
     region: oregon
     # The repo and branch will be auto-detected when you connect the GitHub repo.
@@ -26,10 +27,11 @@ services:
   - type: static
     name: funeralflow-frontend
     env: static
+    root: frontend
     plan: free
     region: oregon
-    buildCommand: "cd frontend && npm install && npm run build:web"
-    publishCommand: "cd frontend && npx serve -s web-build"
+    buildCommand: "npm install && npm run build:web"
+    publishCommand: "npx serve -s web-build"
     envVars:
       - key: EXPO_PUBLIC_API_URL
         sync: false

@@ -4,7 +4,9 @@
 
 Recommended targets: Render, Railway, Fly.io, AWS ECS, DigitalOcean App Platform.
 
-1. Provision PostgreSQL.
+Use Render with a managed Neon Postgres database by setting `DATABASE_URL` to your Neon connection string. The repository includes `render.yaml`, so Render can deploy the backend from `server/` and the frontend from `frontend/` without committing local `.env` files.
+
+1. Provision PostgreSQL (Neon or another managed provider).
 2. Set all environment variables from `server/.env.example`.
 3. Run migrations: `psql $DATABASE_URL -f database/schema.sql`.
 4. Build: `npm run build`.
