@@ -1,0 +1,16 @@
+services:
+  - type: web_service
+    name: funeralflow-backend
+    env: node
+    plan: starter
+    repo: https://github.com/issahabdulhakim210210-create/FuneralFlow.git
+    branch: app-release
+    buildCommand: cd server && npm install && npm run build
+    startCommand: cd server && npm start
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "4000"
