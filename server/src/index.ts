@@ -2,6 +2,7 @@ import express from 'express';
 import { security } from './middleware/security.js';
 import authRoutes from './routes/authRoutes.js';
 import paymentRoutes from './routes/paymentRoutes.js';
+import ratingsRoutes from './routes/ratingsRoutes.js';
 import coreRoutes from './routes/coreRoutes.js';
 import adminRoutes from './routes/adminRoutes.js';
 import documentRoutes from './routes/documentRoutes.js';
@@ -12,13 +13,15 @@ const app = express();
 app.set('trust proxy', 1);
 app.use(security);
 app.use(express.json({ limit: '2mb' }));
+app.use('/uploads', express.static('uploads'));
 
 app.get('/api/health', (_, res) => res.json({ ok: true, name: 'Funeral Management System API' }));
 app.use('/api/auth', authRoutes);
 app.use('/api/payments', paymentRoutes);
+app.use('/api/ratings', ratingsRoutes);
+app.use('/api/documents', documentRoutes);
 app.use('/api', coreRoutes);
 app.use('/api/admin', adminRoutes);
-app.use('/api/documents', documentRoutes);
 app.use('/api/notifications', notificationRoutes);
 
 app.use((err: any, req: any, res: any, next: any) => {

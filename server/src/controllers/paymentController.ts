@@ -9,11 +9,65 @@ const amounts: any = {
   ORGANIZER_MONTHLY_SUBSCRIPTION: 10000,
 };
 
+function getEndOfMonth(date: Date) {
+  const end = new Date(date);
+  end.setMonth(end.getMonth() + 1, 0);
+  return end;
+}
+
+function addMonthsSameDay(date: Date, months: number) {
+  const next = new Date(date);
+  const day = next.getDate();
+  next.setMonth(next.getMonth() + months);
+  if (next.getDate() !== day) {
+    next.setDate(0);
+  }
+  return next;
+}
+
+function getMonthlyAmount() {
+  return Number(amounts.ORGANIZER_MONTHLY_SUBSCRIPTION || 10000);
+}
+
+function getExpiredMonthsDue(endsAt: Date, now: Date) {
+  const startOfCurrentMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+  if (endsAt >= startOfCurrentMonth) {
+    return 1;
+  }
+
+  const firstDueMonth = new Date(endsAt.getFullYear(), endsAt.getMonth() + 1, 1);
+  const currentMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+
+  return (
+    (currentMonth.getFullYear() - firstDueMonth.getFullYear()) * 12 +
+    (currentMonth.getMonth() - firstDueMonth.getMonth()) +
+    1
+  );
+}
+
+function getOrganizerMonthlyDueAmount(endsAt: Date | null) {
+  const now = new Date();
+  if (!endsAt) {
+    return getMonthlyAmount();
+  }
+
+  const startOfCurrentMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+  if (endsAt >= startOfCurrentMonth) {
+    return getMonthlyAmount();
+  }
+
+  const dueMonths = getExpiredMonthsDue(endsAt, now);
+  return dueMonths * getMonthlyAmount();
+}
+
 async function createOrExtendOrganizerSubscription(userId: string, paymentId: string, amount: number) {
   const organizerRow = (await query('select id from organizers where user_id = $1 limit 1', [userId])).rows[0];
   if (!organizerRow) return;
 
   const now = new Date();
+  const monthlyAmountGhs = getMonthlyAmount() / 100;
+  const monthsPaid = Math.max(1, Math.floor(amount / monthlyAmountGhs));
+
   const activeSub = (await query(
     `
       select id, ends_at
@@ -27,13 +81,23 @@ async function createOrExtendOrganizerSubscription(userId: string, paymentId: st
   )).rows[0];
 
   let startsAt = now;
-  let endsAt = new Date(now);
-  endsAt.setDate(endsAt.getDate() + 30);
+  let endsAt = getEndOfMonth(now);
 
-  if (activeSub?.ends_at && new Date(activeSub.ends_at) > now) {
-    startsAt = new Date(activeSub.ends_at);
-    endsAt = new Date(activeSub.ends_at);
-    endsAt.setDate(endsAt.getDate() + 30);
+  if (activeSub?.ends_at) {
+    const endsAtDate = new Date(activeSub.ends_at);
+    if (endsAtDate > now) {
+      // Active subscription: extend from current expiration date by the number of months paid.
+      startsAt = endsAtDate;
+      endsAt = addMonthsSameDay(endsAtDate, monthsPaid);
+    } else {
+      // Expired subscription: restore access from today through the end of the paid months.
+      startsAt = now;
+      endsAt = addMonthsSameDay(getEndOfMonth(now), monthsPaid - 1);
+    }
+  } else {
+    // No prior subscription: start now and cover the paid months.
+    startsAt = now;
+    endsAt = addMonthsSameDay(getEndOfMonth(now), monthsPaid - 1);
   }
 
   const subscription = (await query(
@@ -76,15 +140,53 @@ export const initialize = asyncHandler(async (req, res) => {
   const { purpose, provider = 'PAYSTACK', amount, requestId } = req.body;
 
   const u = (await query('select email from users where id=$1', [userId])).rows[0];
-  const amt = amount ? Number(amount) * 100 : amounts[purpose];
-  if (!amt || amt <= 0) throw new AppError(422, 'Valid payment amount is required');
+
+  let requiredAmount = amount ? Number(amount) * 100 : undefined;
+  if (!requiredAmount && amounts[purpose]) {
+    requiredAmount = amounts[purpose];
+  }
+  if (purpose === 'ORGANIZER_MONTHLY_SUBSCRIPTION') {
+    const organizerRow = (await query('select id from organizers where user_id=$1 limit 1', [userId])).rows[0];
+    if (!organizerRow) {
+      throw new AppError(400, 'Organizer profile not found');
+    }
+
+    const activeSub = (await query(
+      `
+        select ends_at
+        from subscriptions
+        where organizer_id = $1
+          and status = 'ACTIVE'
+        order by ends_at desc
+        limit 1
+      `,
+      [organizerRow.id]
+    )).rows[0];
+
+    const endsAt = activeSub?.ends_at ? new Date(activeSub.ends_at) : null;
+    const dueAmount = getOrganizerMonthlyDueAmount(endsAt);
+
+    if (amount) {
+      const requestedAmount = Number(amount) * 100;
+      if (requestedAmount < dueAmount) {
+        throw new AppError(
+          422,
+          `Insufficient payment. You must pay for all missed months plus the current month: ₵${(dueAmount / 100).toFixed(2)}.`
+        );
+      }
+      requiredAmount = requestedAmount;
+    } else {
+      requiredAmount = dueAmount;
+    }
+  }
 
   let organizerPaymentPhone: string | null = null;
   if (purpose === 'INVOICE' && requestId) {
+    // Validate request exists and is in INVOICED status
     const requestRow = (
       await query(
         `
-          select o.payment_phone
+          select fr.id, fr.status, fr.family_member_id, fr.calculated_total, fr.budget, o.payment_phone
           from funeral_requests fr
           join organizers o on o.id = fr.organizer_id
           where fr.id = $1
@@ -92,8 +194,33 @@ export const initialize = asyncHandler(async (req, res) => {
         [requestId]
       )
     ).rows[0];
-    organizerPaymentPhone = requestRow?.payment_phone || null;
+
+    if (!requestRow) {
+      throw new AppError(404, 'Request not found');
+    }
+
+    if (requestRow.status !== 'INVOICED') {
+      throw new AppError(400, `Request must be in INVOICED status to pay. Current status: ${requestRow.status}`);
+    }
+
+    // Verify family member has access to this request
+    if (req.user?.role === 'FAMILY_MEMBER') {
+      const familyMember = (await query('select id from family_members where user_id=$1 limit 1', [userId])).rows[0];
+      if (!familyMember || (requestRow.family_member_id && String(requestRow.family_member_id) !== String(familyMember.id))) {
+        throw new AppError(403, 'You do not have permission to pay for this request');
+      }
+    }
+
+    const requestAmount = Number(requestRow.calculated_total ?? requestRow.budget ?? 0);
+    if (!requiredAmount && requestAmount > 0) {
+      requiredAmount = requestAmount * 100;
+    }
+
+    organizerPaymentPhone = requestRow.payment_phone || null;
   }
+
+  const amt = requiredAmount;
+  if (!amt || amt <= 0) throw new AppError(422, 'Valid payment amount is required');
 
   if (provider === 'HUBTEL') {
     return res.json(await initializeHubtel(userId, amt / 100, purpose));
@@ -128,7 +255,19 @@ export const publicPaystackCallback = asyncHandler(async (req, res) => {
 
   const appUrl = `${env.APP_DEEP_LINK_URL}?reference=${encodeURIComponent(reference)}&paid=true`;
   if (String(req.query.redirect || '').toLowerCase() === 'app' || req.get('accept')?.includes('text/html')) {
-    return res.redirect(appUrl);
+    return res.type('html').send(`<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Returning to app</title>
+    <meta http-equiv="refresh" content="0; url=${appUrl}" />
+  </head>
+  <body style="font-family: sans-serif; text-align: center; padding: 24px;">
+    <p>Returning to the app…</p>
+    <script>window.location.replace(${JSON.stringify(appUrl)});</script>
+  </body>
+</html>`);
   }
 
   res.json({ paid: true, redirectUrl: appUrl });

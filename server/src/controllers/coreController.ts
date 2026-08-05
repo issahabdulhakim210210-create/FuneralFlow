@@ -1,9 +1,14 @@
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { asyncHandler } from '../utils/errors.js';
 import { query } from '../config/db.js';
 import { resolveRequestSubmissionContext } from '../services/requestSubmission.js';
 import { generateSessionSummary, generateFamilyOverview, completeSessionAndNotify } from '../services/summaryService.js';
 import { initializePaystack } from '../services/paymentService.js';
 import { sendWalkInPaymentRequest } from '../services/requestPaymentService.js';
+import { uploadSecure } from '../services/cloudinaryService.js';
+import { canDeleteRequestForUser, canDeleteSessionForUser } from '../utils/permissions.js';
 
 async function getSessionForAccess(identifier:string) {
   const { rows } = await query(
@@ -92,6 +97,57 @@ async function assertDonationAccess(req:any, donationId:string) {
   const donation = (await query('select session_id from donations where id=$1', [donationId])).rows[0];
   if(!donation) throw { status:404, message:'Donation not found' };
   return assertSessionAccess(req, String(donation.session_id));
+}
+
+export async function generateDonationReceiptDocumentFile(donation: any, sessionId: string, collectorName: string | null, collectorIdentifier: string | null) {
+  const { rows: sessionRows } = await query('select session_code from funeral_sessions where id=$1 limit 1', [sessionId]);
+  const sessionCode = sessionRows[0]?.session_code || 'Unknown';
+  const fileName = `receipt-${donation.id}-${Date.now()}.txt`;
+  const tempPath = path.join(os.tmpdir(), fileName);
+
+  const lines = [
+    'Donation Receipt',
+    '----------------',
+    `Session: ${sessionCode}`,
+    `Donation ID: ${donation.id}`,
+    `Donor: ${donation.donor_name || 'Unknown'}`,
+    `Amount: ${Number(donation.amount || 0).toFixed(2)}`,
+    `Paid: ${donation.paid ? 'Yes' : 'No'}`,
+    `Collector: ${collectorName || 'Unknown'}`,
+  ];
+  if (collectorIdentifier) {
+    lines.push(`Collector Identifier: ${collectorIdentifier}`);
+  }
+  lines.push(`Recorded At: ${new Date(donation.created_at || Date.now()).toISOString()}`);
+  lines.push('');
+  lines.push('Thank you for your contribution.');
+
+  try {
+    await fs.promises.writeFile(tempPath, lines.join('\n'), 'utf8');
+    const sizeBytes = (await fs.promises.stat(tempPath)).size;
+    const uploadResult = await uploadSecure(tempPath, `funeral-sessions/${sessionId}`);
+    return { ...uploadResult, mimeType: 'text/plain', sizeBytes };
+  } finally {
+    await fs.promises.unlink(tempPath).catch(() => null);
+  }
+}
+
+async function createDonationReceiptDocument(donation: any, sessionId: string, uploaderUserId: string | null, collectorName: string | null, collectorIdentifier: string | null) {
+  const uploadResult = await generateDonationReceiptDocumentFile(donation, sessionId, collectorName, collectorIdentifier);
+  await query(
+    'insert into documents(session_id,uploader_user_id,document_type,cloudinary_public_id,secure_url,mime_type,size_bytes,collector_name,collector_identifier) values($1,$2,$3,$4,$5,$6,$7,$8,$9)',
+    [
+      sessionId,
+      uploaderUserId,
+      'RECEIPT',
+      uploadResult.public_id,
+      uploadResult.secure_url,
+      uploadResult.mimeType,
+      uploadResult.sizeBytes,
+      collectorName,
+      collectorIdentifier,
+    ]
+  );
 }
 
 async function getPublicSessionForAccess(sessionIdentifier:string, organizerIdentifier: any) {
@@ -244,8 +300,10 @@ export const createPublicSessionDonation = asyncHandler(async (req, res) => {
     return res.status(403).json({ message: error.message || error });
   }
 
+  const approved = false;
+  const approvedBy = null;
   const { rows } = await query(
-    'insert into donations(session_id,type,donor_name,amount,paid,collector_name,collector_identifier,donor_phone,checked_in_at,notes,relative_name,relative_relationship) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) returning *',
+    'insert into donations(session_id,type,donor_name,amount,paid,collector_name,collector_identifier,donor_phone,checked_in_at,notes,relative_name,relative_relationship,approved,approved_by) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) returning *',
     [
       session.id,
       'CASH',
@@ -259,9 +317,14 @@ export const createPublicSessionDonation = asyncHandler(async (req, res) => {
       notes ? String(notes).trim() : null,
       relativeName ? String(relativeName).trim() : null,
       relativeRelationship ? String(relativeRelationship).trim() : null,
+      approved,
+      approvedBy,
     ]
   );
-  res.status(201).json(rows[0]);
+
+  const donation = rows[0];
+
+  res.status(201).json(donation);
 });
 
 export const updatePublicDonation = asyncHandler(async (req, res) => {
@@ -752,7 +815,48 @@ export const organizerProfile = asyncHandler(async (req, res) => {
       o.id as organizer_id,
       o.organizer_identifier,
       o.subscription_status,
-      o.payment_phone
+      o.payment_phone,
+      (
+        select starts_at
+        from subscriptions
+        where organizer_id = o.id
+          and status = 'ACTIVE'
+        order by ends_at desc
+        limit 1
+      ) as subscription_window_starts_at,
+      (
+        select ends_at
+        from subscriptions
+        where organizer_id = o.id
+          and status = 'ACTIVE'
+        order by ends_at desc
+        limit 1
+      ) as subscription_window_ends_at,
+      (
+        select case when ends_at > now() then true else false end
+        from subscriptions
+        where organizer_id = o.id
+          and status = 'ACTIVE'
+        order by ends_at desc
+        limit 1
+      ) as subscription_is_active,
+      (
+        select
+          case
+            when max(ends_at) is null then 10000
+            when max(ends_at) >= date_trunc('month', now()) then 10000
+            else
+              (
+                (date_part('year', date_trunc('month', now())) * 12 + date_part('month', date_trunc('month', now())))
+                -
+                (date_part('year', date_trunc('month', max(ends_at))) * 12 + date_part('month', date_trunc('month', max(ends_at))))
+                + 1
+              ) * 10000
+          end
+        from subscriptions
+        where organizer_id = o.id
+          and status = 'ACTIVE'
+      ) as subscription_due_amount
     from users u
     join organizers o on o.user_id = u.id
     where u.id = $1
@@ -966,6 +1070,40 @@ export const createRequest = asyncHandler(async (req, res) => {
   if (!deceasedFullName || !String(deceasedFullName).trim()) {
     return res.status(422).json({
       message: 'Deceased full name is required',
+    });
+  }
+
+  const funeralDateString = funeralDate ? String(funeralDate).trim() : '';
+  if (!funeralDateString) {
+    return res.status(422).json({
+      message: 'Funeral date is required',
+    });
+  }
+
+  if (!/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(funeralDateString)) {
+    return res.status(422).json({
+      message: 'Funeral date must be in YYYY-MM-DD format',
+    });
+  }
+
+  const [year, month, day] = funeralDateString.split('-').map(Number);
+  const parsedFuneralDate = new Date(year, month - 1, day);
+  if (
+    Number.isNaN(parsedFuneralDate.getTime()) ||
+    parsedFuneralDate.getFullYear() !== year ||
+    parsedFuneralDate.getMonth() !== month - 1 ||
+    parsedFuneralDate.getDate() !== day
+  ) {
+    return res.status(422).json({
+      message: 'Funeral date is not a valid calendar date',
+    });
+  }
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  if (parsedFuneralDate.getTime() < today.getTime()) {
+    return res.status(422).json({
+      message: 'Funeral date cannot be in the past',
     });
   }
 
@@ -1205,6 +1343,129 @@ export const requestWalkInPayment = asyncHandler(async (req, res) => {
     reason: paymentResult.reason,
     message: paymentResult.sent ? 'Walk-in payment request sent.' : 'Unable to send payment request SMS.',
   });
+});
+
+export const confirmWalkInPayment = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+
+  let existingRequest;
+  if (req.user?.role === 'SUPER_ADMIN') {
+    existingRequest = (
+      await query(
+        `
+        select id, organizer_id, submitted_in_person, status
+        from funeral_requests
+        where id=$1
+        limit 1
+        `,
+        [id]
+      )
+    ).rows[0];
+  } else {
+    const organizer = (
+      await query(
+        `
+        select id
+        from organizers
+        where user_id=$1
+        limit 1
+        `,
+        [req.user!.id]
+      )
+    ).rows[0];
+
+    if (!organizer) {
+      return res.status(403).json({ message: 'Organizer profile not found' });
+    }
+
+    existingRequest = (
+      await query(
+        `
+        select id, organizer_id, submitted_in_person, status
+        from funeral_requests
+        where id=$1
+          and organizer_id=$2
+        limit 1
+        `,
+        [id, organizer.id]
+      )
+    ).rows[0];
+  }
+
+  if (!existingRequest) {
+    return res.status(404).json({ message: 'Request not found or you do not have permission to confirm payment' });
+  }
+
+  if (!existingRequest.submitted_in_person) {
+    return res.status(400).json({ message: 'Only walk-in requests can be confirmed with this endpoint' });
+  }
+
+  if (existingRequest.status !== 'INVOICED') {
+    return res.status(400).json({ message: `Only invoiced walk-in requests can be confirmed. Current status is ${existingRequest.status}` });
+  }
+
+  const queryParams = [id];
+  let queryText = `
+    update funeral_requests
+    set status='PAID'
+    where id=$1
+  `;
+
+  if (req.user?.role !== 'SUPER_ADMIN') {
+    queryText += ' and organizer_id=$2';
+    queryParams.push(existingRequest.organizer_id);
+  }
+
+  queryText += '\n    returning *\n    ';
+
+  const { rows } = await query(queryText, queryParams);
+  return res.json(rows[0]);
+});
+
+export const deleteRequest = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+
+  const { rows } = await query(
+    `
+    select id, family_member_id, organizer_id, status
+    from funeral_requests
+    where id=$1
+    limit 1
+    `,
+    [id]
+  );
+
+  const existingRequest = rows[0];
+  if (!existingRequest) {
+    return res.status(404).json({ message: 'Request not found' });
+  }
+
+  const user = req.user;
+  const isSuperAdmin = user?.role === 'SUPER_ADMIN';
+  const currentFamilyMemberId = user?.role === 'FAMILY_MEMBER'
+    ? (await query('select id from family_members where user_id=$1 limit 1', [user.id])).rows[0]?.id
+    : null;
+  const currentOrganizerId = user?.role === 'ORGANIZER'
+    ? (await query('select id from organizers where user_id=$1 limit 1', [user.id])).rows[0]?.id
+    : null;
+  const canDelete = isSuperAdmin || canDeleteRequestForUser({
+    role: user?.role,
+    requestFamilyMemberId: existingRequest.family_member_id,
+    requestOrganizerId: existingRequest.organizer_id,
+    currentFamilyMemberId,
+    currentOrganizerId,
+  });
+
+  if (!canDelete) {
+    return res.status(403).json({ message: 'Not authorized for this request' });
+  }
+
+  if (!isSuperAdmin && user?.role !== 'FAMILY_MEMBER' && !['REJECTED', 'SESSION_CREATED'].includes(existingRequest.status)) {
+    return res.status(400).json({ message: 'Only rejected or session-created requests can be deleted' });
+  }
+
+  await query('delete from funeral_requests where id=$1', [id]);
+  return res.json({ message: 'Deleted' });
 });
 
 export const declineRequest = asyncHandler(async (req, res) => {
@@ -1539,7 +1800,7 @@ export const createSession = asyncHandler(async (req, res) => {
       status,
       budget_final
     )
-    values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+    values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
     returning *
     `,
     [
@@ -1560,7 +1821,7 @@ export const createSession = asyncHandler(async (req, res) => {
     // fetch request snapshot and copy into session_meta and budget_final
     const requestSnapshot = (
       await query(
-        `select family_member_id, deceased_full_name, status, selected_services, service_pricing_details, calculated_total, budget, funeral_date from funeral_requests where id=$1 ${req.user?.role === 'SUPER_ADMIN' ? '' : 'and organizer_id=$2'} limit 1`,
+        `select family_member_id, deceased_full_name, status, selected_services, service_pricing_details, calculated_total, budget, funeral_date, submitted_in_person from funeral_requests where id=$1 ${req.user?.role === 'SUPER_ADMIN' ? '' : 'and organizer_id=$2'} limit 1`,
         req.user?.role === 'SUPER_ADMIN' ? [requestId] : [requestId, organizerId]
       )
     ).rows[0];
@@ -1590,6 +1851,8 @@ export const sessions = asyncHandler(async (req, res) => {
       `
       select 
         fs.*,
+        metadata->>'previous_status' as previous_status,
+        fr.submitted_in_person as request_submitted_in_person,
         ou.full_name as organizer_name,
         fu.full_name as family_member_name
       from funeral_sessions fs
@@ -1597,6 +1860,16 @@ export const sessions = asyncHandler(async (req, res) => {
       join users ou on ou.id = o.user_id
       left join family_members fm on fm.id = fs.family_member_id
       left join users fu on fu.id = fm.user_id
+      left join funeral_requests fr on fr.id = fs.request_id
+      left join lateral (
+        select metadata
+        from audit_logs al
+        where al.entity='funeral_sessions'
+          and al.action='ARCHIVE_SESSION'
+          and al.entity_id = fs.id
+        order by al.created_at desc
+        limit 1
+      ) al on true
       order by fs.created_at desc
       limit 200
       `
@@ -1617,6 +1890,8 @@ export const sessions = asyncHandler(async (req, res) => {
       `
       select 
         fs.*,
+        metadata->>'previous_status' as previous_status,
+        fr.submitted_in_person as request_submitted_in_person,
         ou.full_name as organizer_name,
         fu.full_name as family_member_name
       from funeral_sessions fs
@@ -1624,6 +1899,16 @@ export const sessions = asyncHandler(async (req, res) => {
       join users ou on ou.id = o.user_id
       left join family_members fm on fm.id = fs.family_member_id
       left join users fu on fu.id = fm.user_id
+      left join funeral_requests fr on fr.id = fs.request_id
+      left join lateral (
+        select metadata
+        from audit_logs al
+        where al.entity='funeral_sessions'
+          and al.action='ARCHIVE_SESSION'
+          and al.entity_id = fs.id
+        order by al.created_at desc
+        limit 1
+      ) al on true
       where fs.organizer_id = $1
       order by fs.created_at desc
       limit 200
@@ -1646,6 +1931,8 @@ export const sessions = asyncHandler(async (req, res) => {
       `
       select distinct
         fs.*,
+        metadata->>'previous_status' as previous_status,
+        fr.submitted_in_person as request_submitted_in_person,
         ou.full_name as organizer_name,
         fu.full_name as family_member_name
       from funeral_sessions fs
@@ -1654,6 +1941,15 @@ export const sessions = asyncHandler(async (req, res) => {
       left join family_members fm on fm.id = fs.family_member_id
       left join users fu on fu.id = fm.user_id
       left join funeral_requests fr on fr.id = fs.request_id
+      left join lateral (
+        select metadata
+        from audit_logs al
+        where al.entity='funeral_sessions'
+          and al.action='ARCHIVE_SESSION'
+          and al.entity_id = fs.id
+        order by al.created_at desc
+        limit 1
+      ) al on true
       where fs.family_member_id = $1
          or fr.family_member_id = $1
       order by fs.created_at desc
@@ -1673,12 +1969,15 @@ export const getSession = asyncHandler(async (req, res) => {
   await assertSessionAccess(req, String(id));
   const { rows } = await query(
     `
-    select fs.*, ou.full_name as organizer_name, fu.full_name as family_member_name
+    select fs.*, ou.full_name as organizer_name, fu.full_name as family_member_name,
+      fr.family_member_id as request_family_member_id,
+      fr.submitted_in_person
     from funeral_sessions fs
     join organizers o on o.id = fs.organizer_id
     join users ou on ou.id = o.user_id
     left join family_members fm on fm.id = fs.family_member_id
     left join users fu on fu.id = fm.user_id
+    left join funeral_requests fr on fr.id = fs.request_id
     where fs.id = $1
     limit 1
     `,
@@ -1686,7 +1985,26 @@ export const getSession = asyncHandler(async (req, res) => {
   );
 
   if (!rows[0]) return res.status(404).json({ message: 'Session not found' });
-  return res.json(rows[0]);
+
+  const session = rows[0];
+  const user = req.user;
+  let canAccessDocuments = false;
+
+  if (user?.role === 'SUPER_ADMIN') {
+    canAccessDocuments = true;
+  } else if (user?.role === 'FAMILY_MEMBER') {
+    const familyMember = (await query('select id from family_members where user_id=$1 limit 1', [user.id])).rows[0];
+    if (familyMember) {
+      canAccessDocuments = (session.family_member_id === familyMember.id || session.request_family_member_id === familyMember.id);
+    }
+  } else if (user?.role === 'ORGANIZER') {
+    const organizer = (await query('select id from organizers where user_id=$1', [user.id])).rows[0];
+    if (organizer && organizer.id === session.organizer_id) {
+      canAccessDocuments = true;
+    }
+  }
+
+  return res.json({ ...session, can_access_documents: canAccessDocuments });
 });
 
 export const updateSession = asyncHandler(async (req, res) => {
@@ -1730,13 +2048,17 @@ export const archiveSession = asyncHandler(async (req, res) => {
   // allow organizer to archive even if completed
   await assertOrganizerAccessAllowCompleted(req, String(id));
 
+  const { rows: currentRows } = await query('select status from funeral_sessions where id=$1 limit 1', [id]);
+  if (!currentRows[0]) return res.status(404).json({ message: 'Session not found' });
+  const previousStatus = currentRows[0].status;
+
   const { rows } = await query(`update funeral_sessions set status='ARCHIVED', archived_at=now() where id=$1 returning *`, [id]);
   if (!rows[0]) return res.status(404).json({ message: 'Session not found' });
   try {
     await query(
       `insert into audit_logs(user_id, action, entity, entity_id, metadata, created_at)
        values ($1,$2,$3,$4,$5, now())`,
-      [req.user?.id || null, 'ARCHIVE_SESSION', 'funeral_sessions', id, JSON.stringify({ previous_status: rows[0].status })]
+      [req.user?.id || null, 'ARCHIVE_SESSION', 'funeral_sessions', id, JSON.stringify({ previous_status: previousStatus })]
     );
   } catch (e) {
     // non-fatal: audit failure should not block primary action
@@ -1748,16 +2070,36 @@ export const archiveSession = asyncHandler(async (req, res) => {
 export const deleteSession = asyncHandler(async (req, res) => {
   const { id } = req.params;
 
-  // fetch session to check status and ownership
-  const { rows: srows } = await query('select id, status, organizer_id from funeral_sessions where id=$1', [id]);
+  const { rows: srows } = await query(
+    `
+    select fs.id, fs.status, fs.organizer_id, fs.family_member_id, fr.family_member_id as request_family_member_id
+    from funeral_sessions fs
+    left join funeral_requests fr on fr.id = fs.request_id
+    where fs.id=$1
+    limit 1
+    `,
+    [id]
+  );
   const session = srows[0];
   if (!session) return res.status(404).json({ message: 'Session not found' });
 
-  // allow super admin to delete any, organizers only their own
-  if (req.user?.role !== 'SUPER_ADMIN') {
-    const organizer = (await query('select id from organizers where user_id=$1', [req.user!.id])).rows[0];
-    if (!organizer) return res.status(403).json({ message: 'Organizer profile not found' });
-    if (organizer.id !== session.organizer_id) return res.status(403).json({ message: 'Not authorized for this session' });
+  const user = req.user;
+  const isSuperAdmin = user?.role === 'SUPER_ADMIN';
+  const canDelete = isSuperAdmin || canDeleteSessionForUser({
+    role: user?.role,
+    sessionFamilyMemberId: session.family_member_id,
+    sessionOrganizerId: session.organizer_id,
+    requestFamilyMemberId: session.request_family_member_id,
+    currentFamilyMemberId: user?.role === 'FAMILY_MEMBER'
+      ? (await query('select id from family_members where user_id=$1 limit 1', [user.id])).rows[0]?.id
+      : null,
+    currentOrganizerId: user?.role === 'ORGANIZER'
+      ? (await query('select id from organizers where user_id=$1 limit 1', [user.id])).rows[0]?.id
+      : null,
+  });
+
+  if (!canDelete) {
+    return res.status(403).json({ message: 'Not authorized for this session' });
   }
 
   if (session.status !== 'COMPLETED' && session.status !== 'ARCHIVED') {
@@ -2052,8 +2394,11 @@ export const addDonation = asyncHandler(async (req, res) => {
     recorderName = user.rows[0]?.full_name || null;
   }
 
+  const approved = req.user?.role === 'ORGANIZER' || req.user?.role === 'SUPER_ADMIN';
+  const approvedBy = approved ? req.user?.id : null;
+
   const { rows } = await query(
-    'insert into donations(session_id,type,donor_name,amount,paid,collector_name,collector_identifier,family_member_id,relative_name,relative_relationship) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) returning *',
+    'insert into donations(session_id,type,donor_name,amount,paid,collector_name,collector_identifier,family_member_id,relative_name,relative_relationship,approved,approved_by) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) returning *',
     [
       verifiedSessionId,
       'CASH',
@@ -2065,9 +2410,27 @@ export const addDonation = asyncHandler(async (req, res) => {
       familyMemberId,
       relativeName ? String(relativeName).trim() : null,
       relativeRelationship ? String(relativeRelationship).trim() : null,
+      approved,
+      approvedBy,
     ]
   );
-  res.status(201).json(rows[0]);
+
+  const donation = rows[0];
+  if (approved) {
+    try {
+      await createDonationReceiptDocument(
+        donation,
+        verifiedSessionId,
+        req.user?.id || null,
+        recorderName || (collectorName ? String(collectorName).trim() : null),
+        collectorIdentifier ? String(collectorIdentifier).trim() : null
+      );
+    } catch (error: any) {
+      console.error('Failed to create receipt document for donation:', error);
+    }
+  }
+
+  res.status(201).json(donation);
 });
 
 export const getDonation = asyncHandler(async (req, res) => {
@@ -2101,8 +2464,11 @@ export const createSessionDonation = asyncHandler(async (req, res) => {
     recorderName = user.rows[0]?.full_name || null;
   }
 
+  const approved = req.user?.role === 'ORGANIZER' || req.user?.role === 'SUPER_ADMIN';
+  const approvedBy = approved ? req.user?.id : null;
+
   const { rows } = await query(
-    'insert into donations(session_id,type,donor_name,amount,paid,collector_name,collector_identifier,donor_phone,checked_in_at,notes,family_member_id,relative_name,relative_relationship) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) returning *',
+    'insert into donations(session_id,type,donor_name,amount,paid,collector_name,collector_identifier,donor_phone,checked_in_at,notes,family_member_id,relative_name,relative_relationship,approved,approved_by) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) returning *',
     [
       sessionId,
       'CASH',
@@ -2117,9 +2483,28 @@ export const createSessionDonation = asyncHandler(async (req, res) => {
       familyMemberId,
       relativeName ? String(relativeName).trim() : null,
       relativeRelationship ? String(relativeRelationship).trim() : null,
+      approved,
+      approvedBy,
     ]
   );
-  res.status(201).json(rows[0]);
+
+  const donation = rows[0];
+
+  if (approved) {
+    try {
+      await createDonationReceiptDocument(
+        donation,
+        sessionId,
+        req.user?.id || null,
+        recorderName || (collectorName ? String(collectorName).trim() : null),
+        collectorIdentifier ? String(collectorIdentifier).trim() : null
+      );
+    } catch (error: any) {
+      console.error('Failed to create receipt document for donation:', error);
+    }
+  }
+
+  res.status(201).json(donation);
 });
 
 export const listDonations = asyncHandler(async (req, res) => {
@@ -2191,6 +2576,7 @@ export const updateDonation = asyncHandler(async (req, res) => {
     params.push(notes ? String(notes).trim() : null);
     updates.push(`notes=$${params.length}`);
   }
+  const approvalBecameTrue = approved !== undefined && Boolean(approved) && !donation.approved;
   if (amount !== undefined) {
     params.push(Number(amount));
     updates.push(`amount=$${params.length}`);
@@ -2217,6 +2603,21 @@ export const updateDonation = asyncHandler(async (req, res) => {
   params.push(id);
   const { rows } = await query(`update donations set ${updates.join(', ')} where id=$${params.length} returning *`, params);
 
+  const updatedDonation = rows[0];
+  if (approvalBecameTrue) {
+    try {
+      await createDonationReceiptDocument(
+        updatedDonation,
+        donation.session_id,
+        req.user?.id || null,
+        donation.collector_name,
+        donation.collector_identifier
+      );
+    } catch (error: any) {
+      console.error('Failed to create receipt document after approval:', error);
+    }
+  }
+
   // If amount was changed and a per-donation approved request was used, mark it consumed
   try {
     if (amount !== undefined && consumedRequestId) {
@@ -2228,7 +2629,7 @@ export const updateDonation = asyncHandler(async (req, res) => {
     // non-fatal
   }
 
-  res.json(rows[0]);
+  res.json(updatedDonation);
 });
 
 // Mobile-money donation requests removed; endpoint deleted.

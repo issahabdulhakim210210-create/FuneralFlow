@@ -12,7 +12,10 @@ export async function generateSessionSummary(sessionId: string) {
   const notes = (await query('select * from notes where session_id=$1', [sessionId])).rows;
 
   const totalExpenses = expenses.reduce((s: any, e: any) => s + Number(e.amount || 0), 0);
-  const totalDonations = donations.reduce((s: any, d: any) => s + Number(d.amount || d.estimated_value || 0), 0);
+  const totalDonations = donations.reduce((s: any, d: any) => {
+    if (!d.approved || !d.paid) return s;
+    return s + Number(d.amount || d.estimated_value || 0);
+  }, 0);
   const checkedItems = checklists.filter((c: any) => c.completed).length;
 
   const report = {

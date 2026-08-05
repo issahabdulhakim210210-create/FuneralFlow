@@ -17,6 +17,7 @@ export function resolveTwilioSenderNumber() {
 export async function sendSms(to: string, message: string) {
   const senderNumber = resolveTwilioSenderNumber();
   const normalizedTo = to.trim();
+  console.log(`[SMS] Sending to ${normalizedTo}: ${message}`);
 
   if (env.NODE_ENV === 'development' && (!env.TWILIO_ACCOUNT_SID || !env.TWILIO_AUTH_TOKEN || !senderNumber)) {
     console.log('📱 [DEV SMS]', { to: normalizedTo, message, sender: senderNumber || 'not-configured' });

@@ -47,7 +47,9 @@ r.get('/requests', c.listRequests);
 r.post('/requests', requireRoles('FAMILY_MEMBER','ORGANIZER','SUPER_ADMIN'), c.createRequest);
 r.post('/requests/:id/accept', requireRoles('ORGANIZER','SUPER_ADMIN'), c.acceptRequest);
 r.post('/requests/:id/decline', requireRoles('ORGANIZER','SUPER_ADMIN'), c.declineRequest);
+r.delete('/requests/:id', requireRoles('FAMILY_MEMBER','ORGANIZER','SUPER_ADMIN'), c.deleteRequest);
 r.post('/requests/:id/request-walkin-payment', requireRoles('ORGANIZER','SUPER_ADMIN'), c.requestWalkInPayment);
+r.post('/requests/:id/confirm-walkin-payment', requireRoles('ORGANIZER','SUPER_ADMIN'), c.confirmWalkInPayment);
 
 r.post('/sessions', requireRoles('ORGANIZER','SUPER_ADMIN'), c.createSession);
 r.get('/sessions', c.sessions);
